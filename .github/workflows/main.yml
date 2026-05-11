@@ -1,0 +1,57 @@
+name: Python 3.13 – Clone, Commit & Push
+
+on:
+  # Adjust triggers to your needs (e.g. push, pull_request, workflow_dispatch)
+  push:
+    branches: [ main ]
+  workflow_dispatch:   # allows manual trigger
+
+# Essential: grant write permission to the repository contents
+permissions:
+  contents: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Clone the repository (including full history so we can push later)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # clone all history (needed for some operations)
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # 2. Set up Python 3.13
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # 3. Install dependencies
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      # 4. Run your Python script (modifies files, generates output, etc.)
+      - name: Run Python script
+        run: python your_script.py   # replace with your actual script
+
+      # 5. Configure Git (using the GitHub Actions bot identity)
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # 6. Commit any changes (if there are any) and push back
+      - name: Commit and push changes
+        run: |
+          git add -A
+          # Only commit if there are staged changes
+          if ! git diff --cached --quiet; then
+            git commit -m "Automated update from GitHub Actions"
+            git push
+          else
+            echo "No changes to commit."
+          fi
