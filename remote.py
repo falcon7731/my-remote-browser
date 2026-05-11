@@ -313,20 +313,34 @@ class GitRepo:
 '''
 def run(browser, git_repo, page, scheduler):
     """
-    PLACE YOUR CUSTOM AUTOMATION HERE.
-    This function is called after:
-      - Git repo is ready (pulled latest),
-      - Browser is started (if --browser),
-      - A new page is open.
-    You have access to:
-      - browser: StealthBrowser instance (call browser.goto, click, etc.)
-      - git_repo: GitRepo instance
-      - page: Playwright page object (already open)
-      - scheduler: TaskScheduler instance (schedule periodic tasks)
+    Actions‑friendly automation:
+      1. Go to YouTube (invisible headless browser)
+      2. Save a screenshot (youtube.png)
+      3. Push the file to the 'season' branch
     """
-    # Example: Navigate to a site, take a screenshot
-    browser.goto(page, "https://example.com")
-    wait_for_page_loaded(page)
+    if browser is None or page is None:
+        print("❌ Browser not available. Run with --browser --headless in Actions.")
+        return
+
+    # 1. Navigate to YouTube and wait until fully loaded
+    browser.goto(page, "https://www.youtube.com")
+    wait_for_page_loaded(page, timeout=30000)
+
+    # 2. Take screenshot
+    screenshot_file = "youtube.png"
+    browser.screenshot(page, screenshot_file)
+    print(f"📸 Screenshot saved: {screenshot_file}")
+
+    # 3. Switch to / reset the 'season' branch (create if not exists,
+    #    reset to the current commit to avoid conflicts)
+    git_repo.repo.git.checkout('-B', 'season')
+
+    # 4. Stage the new file, commit, and push with upstream
+    git_repo.add_all()
+    git_repo.commit("Add YouTube screenshot")
+    git_repo.repo.git.push('--set-upstream', 'origin', 'season')
+
+    print("✅ Screenshot pushed to 'season' branch.")
 
     
 

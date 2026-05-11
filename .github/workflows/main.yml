@@ -37,5 +37,5 @@ jobs:
           
 
       - name: Run script (with browser)
-        run: python repo_and_browser_tool.py --browser
+        run: python repo_and_browser_tool.py --browser --headless
         
