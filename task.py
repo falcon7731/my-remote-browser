@@ -14,6 +14,3 @@ git_repo.repo.git.push('--force', '--set-upstream', 'origin', 'server')
 
 log("Success: screenshot saved and pushed to server branch.")
 
-# Keep alive (optional)
-while True:
-    time.sleep(3600)
