@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Remote-driven automation script.
-- Reads task code from the 'client' branch (task.py)
-- Executes it on the 'server' branch (with browser, git, etc.)
-- After execution (success or failure), both branches are emptied completely.
-All output is printed to the console (no log files).
+Remote‑driven automation orchestrator with cursor helpers, shallow updates,
+and a continuous polling loop that executes numerically‑named .py files
+from the 'client' branch on the 'server' branch.
+
+After manual stop, both branches are completely emptied (no files, no history).
 """
 
-import os, sys, time, traceback, threading, argparse, shutil
+import os, sys, time, traceback, threading, argparse, shutil, re
 from git import Repo, GitCommandError
 
 # ---------- Playwright import ----------
@@ -17,12 +17,11 @@ try:
 except ImportError:
     HAS_PLAYWRIGHT = False
 
-# ==================== CONSOLE LOGGING ONLY ====================
+# ==================== CONSOLE LOGGING ====================
 def log(msg: str):
-    """Print message to stdout (no file logging)."""
+    """Print to stdout immediately."""
     print(msg, flush=True)
 
-# Global exception handler (prints traceback, no file write)
 def global_exception_handler(exc_type, exc_value, exc_tb):
     tb_str = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
     log(f"FATAL UNHANDLED EXCEPTION:\n{tb_str}")
@@ -31,7 +30,6 @@ sys.excepthook = global_exception_handler
 
 # ==================== TASK SCHEDULER ====================
 class TaskScheduler:
-    """Minimal scheduler (unchanged)."""
     def __init__(self):
         self.jobs = []
 
@@ -77,7 +75,6 @@ class TaskScheduler:
 
 # ==================== STEALTH BROWSER ====================
 class StealthBrowser:
-    """Manages a persistent Chromium with anti-detection flags."""
     def __init__(self, user_data_dir="./browser_profile", headless=False):
         if not HAS_PLAYWRIGHT:
             raise RuntimeError("Playwright not installed.")
@@ -184,9 +181,13 @@ def wait_timeout(page, seconds):
     log("[Page] Fixed wait done.")
 
 
+# ------------------ Cursor helpers (injected into tasks) ------------------
+# These are defined inside the orchestration loop because they need the live `page` object.
+# We'll create them later and inject them into task_globals.
+
+
 # ==================== GIT OPERATIONS ====================
 class GitRepo:
-    """Wrapper for Git operations (no REST API)."""
     def __init__(self, repo_path="."):
         log(f"[Git] Initialising repo at {repo_path}")
         self.repo = Repo(repo_path)
@@ -212,8 +213,12 @@ class GitRepo:
         log(f"[Git] Shallow fetch {branch}")
 
     def shallow_pull(self, branch="main"):
-        self.repo.git.pull("--depth", "1", "origin", branch)
-        log(f"[Git] Shallow pull {branch}")
+        """Shallow pull (depth=1) for the given branch. Ignores errors if branch doesn't exist yet."""
+        try:
+            self.repo.git.pull("--depth", "1", "origin", branch)
+            log(f"[Git] Shallow pull of '{branch}' done.")
+        except GitCommandError as e:
+            log(f"[Git] Shallow pull of '{branch}' failed (maybe no remote?): {e}")
 
     def check_branch_update(self, branch="main"):
         self.origin.fetch()
@@ -288,9 +293,7 @@ class GitRepo:
     def _empty_orphan_branch(self, branch_name):
         """Create (or reset) an orphan branch, delete all content, commit empty, force push."""
         log(f"[Git] Orphaning branch '{branch_name}'...")
-        # Create an orphan branch (no parent)
         self.repo.git.checkout('--orphan', branch_name)
-        # Delete all files except .git
         for item in os.listdir('.'):
             if item != '.git':
                 full_path = os.path.join('.', item)
@@ -298,99 +301,176 @@ class GitRepo:
                     os.remove(full_path)
                 elif os.path.isdir(full_path):
                     shutil.rmtree(full_path)
-        # Commit empty (allow empty)
         self.repo.git.commit('--allow-empty', '-m', 'Empty branch')
-        # Force push to overwrite remote
         self.repo.git.push('--force', '--set-upstream', 'origin', branch_name)
         log(f"[Git] Branch '{branch_name}' is now empty (orphaned).")
 
 
-# ==================== TASK EXECUTION LOGIC ====================
-def execute_task(git_repo, browser, page, scheduler):
+# ==================== TASK ORCHESTRATION LOOP ====================
+def natural_sort_key(filename):
+    """Extract the leading integer from a filename like '12.py' for natural sorting."""
+    m = re.match(r'(\d+)', filename)
+    return int(m.group(1)) if m else float('inf')
+
+
+def orchestrate_loop(git_repo, browser, page, scheduler):
     """
-    Reads task.py from the 'client' branch, then executes it on the 'server' branch.
-    Access to all helper objects is provided.
+    Infinite loop:
+     1. Checkout client branch, shallow update.
+     2. Find next unexecuted .py file (numerically sorted).
+     3. If none, wait 3s and repeat.
+     4. Read script, switch to server, shallow update.
+     5. Execute script with injected helpers + sequence_number.
+     6. Mark as executed, loop back to step 1.
     """
-    log("=== Starting task orchestration ===")
+    log("=== Starting infinity task loop ===")
+    executed = set()  # filenames (without .py extension) already processed
 
-    # 1. Fetch all branches (so we can see client & server)
-    log("Fetching all branches...")
-    git_repo.origin.fetch()
+    # ---------- Build cursor helper functions (if browser is active) ----------
+    cursor_helpers = {}
+    if page is not None:
+        # We'll define them here and later inject them into task_globals.
+        def _move_mouse(x, y):
+            page.mouse.move(x, y)
 
-    # 2. Checkout client branch and read task file
-    try:
-        git_repo.repo.git.checkout('client')
-    except GitCommandError:
-        # If client branch doesn't exist locally, create it from origin/client?
-        # Try to fetch and checkout again, or just create a new empty one.
-        log("Client branch not found locally, trying to create from remote...")
+        def _get_cursor_position():
+            # The position is tracked inside the page via a mousemove listener.
+            # We retrieve it from a global variable set by show_cursor.
+            pos = page.evaluate("""() => {
+                return { x: window.__cursorX || 0, y: window.__cursorY || 0 };
+            }""")
+            return pos['x'], pos['y']
+
+        def _show_cursor():
+            # Inject a visible cursor element that follows the mouse and shows in screenshots.
+            page.evaluate("""() => {
+                if (document.getElementById('__custom_cursor')) return;
+                let cursor = document.createElement('div');
+                cursor.id = '__custom_cursor';
+                cursor.style.position = 'fixed';
+                cursor.style.width = '20px';
+                cursor.style.height = '20px';
+                cursor.style.borderRadius = '50%';
+                cursor.style.backgroundColor = 'red';
+                cursor.style.pointerEvents = 'none';
+                cursor.style.zIndex = '999999';
+                cursor.style.transform = 'translate(-50%, -50%)';
+                document.body.appendChild(cursor);
+                window.__cursorX = 0;
+                window.__cursorY = 0;
+                window.addEventListener('mousemove', e => {
+                    window.__cursorX = e.clientX;
+                    window.__cursorY = e.clientY;
+                    cursor.style.left = e.clientX + 'px';
+                    cursor.style.top = e.clientY + 'px';
+                });
+            }""")
+
+        def _hide_cursor():
+            page.evaluate("""() => {
+                let cursor = document.getElementById('__custom_cursor');
+                if (cursor) cursor.remove();
+            }""")
+
+        cursor_helpers = {
+            'move_mouse': _move_mouse,
+            'get_cursor_position': _get_cursor_position,
+            'show_cursor': _show_cursor,
+            'hide_cursor': _hide_cursor,
+        }
+
+    while True:
         try:
-            git_repo.repo.git.checkout('-b', 'client', 'origin/client')
-        except GitCommandError:
-            log("No remote client branch either. Skipping task execution.")
-            return
+            # ----- 1. Switch to client + shallow update -----
+            try:
+                git_repo.repo.git.checkout('client')
+            except GitCommandError:
+                log("Client branch missing. Creating empty one locally (will push later).")
+                git_repo.repo.git.checkout('--orphan', 'client')
+                git_repo.repo.git.rm('-rf', '--cached', '.')
+                for item in os.listdir('.'):
+                    if item != '.git':
+                        full = os.path.join('.', item)
+                        if os.path.isfile(full) or os.path.islink(full): os.remove(full)
+                        elif os.path.isdir(full): shutil.rmtree(full)
+                git_repo.repo.git.commit('--allow-empty', '-m', 'Empty client branch')
+                # Push so remote knows about it (only once)
+                git_repo.repo.git.push('--force', '--set-upstream', 'origin', 'client')
 
-    task_file = "task.py"
-    if not os.path.isfile(task_file):
-        log(f"No {task_file} found on client branch. Nothing to execute.")
-        return
+            # Shallow update: pull latest files only
+            git_repo.shallow_pull('client')
 
-    with open(task_file, "r", encoding="utf-8") as f:
-        task_code = f.read()
-    log("Task code loaded from client branch.")
+            # ----- 2. Discover unexecuted scripts -----
+            all_files = [f for f in os.listdir('.') if f.endswith('.py') and f != '__init__.py']
+            unexecuted = [f for f in all_files if os.path.splitext(f)[0] not in executed]
 
-    # 3. Switch to server branch (create if not exists)
-    try:
-        git_repo.repo.git.checkout('server')
-    except GitCommandError:
-        log("Server branch not found locally, creating from remote or empty...")
-        try:
-            git_repo.repo.git.checkout('-b', 'server', 'origin/server')
-        except GitCommandError:
-            log("Creating a new empty server branch.")
-            git_repo._empty_orphan_branch('server')  # but we need to stay on server
-            # after emptying, we are on server. The _empty_orphan_branch does a commit+push.
-            # But we don't want to push now, just have a clean environment.
-            # Actually, we'll just use _empty_orphan_branch for cleanup later; for now just create orphan locally.
-            # Better: just checkout a new orphan branch without pushing.
-            git_repo.repo.git.checkout('--orphan', 'server')
-            git_repo.repo.git.rm('-rf', '--cached', '.')
-            # Clean working tree
-            for item in os.listdir('.'):
-                if item != '.git':
-                    full = os.path.join('.', item)
-                    if os.path.isfile(full) or os.path.islink(full):
-                        os.remove(full)
-                    elif os.path.isdir(full):
-                        shutil.rmtree(full)
-            git_repo.repo.git.commit('--allow-empty', '-m', 'Empty server branch')
+            if not unexecuted:
+                log("No new unexecuted scripts. Waiting 3 seconds...")
+                time.sleep(3)
+                continue
 
-    log("Ready to execute task on server branch.")
+            # Natural sort by leading integer
+            unexecuted.sort(key=natural_sort_key)
+            script_name = unexecuted[0]
+            script_stem = os.path.splitext(script_name)[0]
+            log(f"Next script: {script_name} (sequence {script_stem})")
 
-    # 4. Execute the task code, providing all helpers
-    task_globals = {
-        'browser': browser,
-        'page': page,
-        'git_repo': git_repo,
-        'scheduler': scheduler,
-        'log': log,
-        'wait_for_page_loaded': wait_for_page_loaded,
-        'wait_for_element': wait_for_element,
-        'wait_timeout': wait_timeout,
-        # optionally add other useful modules
-        'time': time,
-        'os': os,
-        'sys': sys,
-    }
-    try:
-        exec(compile(task_code, 'task.py', 'exec'), task_globals)
-        log("Task executed successfully.")
-    except Exception as e:
-        log(f"Task execution failed: {e}")
-        traceback.print_exc()
-        # Don't re-raise; we still want cleanup to run
+            # Read code while on client
+            with open(script_name, 'r', encoding='utf-8') as f:
+                code = f.read()
 
-    log("=== Task orchestration finished ===")
+            # ----- 3. Switch to server + shallow update -----
+            try:
+                git_repo.repo.git.checkout('server')
+            except GitCommandError:
+                log("Server branch missing. Creating empty locally.")
+                git_repo.repo.git.checkout('--orphan', 'server')
+                git_repo.repo.git.rm('-rf', '--cached', '.')
+                for item in os.listdir('.'):
+                    if item != '.git':
+                        full = os.path.join('.', item)
+                        if os.path.isfile(full) or os.path.islink(full): os.remove(full)
+                        elif os.path.isdir(full): shutil.rmtree(full)
+                git_repo.repo.git.commit('--allow-empty', '-m', 'Empty server branch')
+                # push
+                git_repo.repo.git.push('--force', '--set-upstream', 'origin', 'server')
+
+            git_repo.shallow_pull('server')
+
+            # ----- 4. Execute script -----
+            task_globals = {
+                'browser': browser,
+                'page': page,
+                'git_repo': git_repo,
+                'scheduler': scheduler,
+                'log': log,
+                'wait_for_page_loaded': wait_for_page_loaded,
+                'wait_for_element': wait_for_element,
+                'wait_timeout': wait_timeout,
+                'time': time,
+                'os': os,
+                'sys': sys,
+                'sequence_number': script_stem,
+            }
+            # Add cursor helpers if available
+            task_globals.update(cursor_helpers)
+
+            log(f"--- Executing {script_name} ---")
+            try:
+                exec(compile(code, script_name, 'exec'), task_globals)
+                log(f"{script_name} completed successfully.")
+            except Exception as e:
+                log(f"{script_name} failed: {e}")
+                traceback.print_exc()
+
+            # ----- 5. Mark as executed -----
+            executed.add(script_stem)
+            log(f"Marked {script_name} as executed. Total completed: {len(executed)}")
+
+        except Exception as loop_err:
+            log(f"Loop iteration error (will retry): {loop_err}")
+            traceback.print_exc()
+            time.sleep(5)   # Avoid tight crash loop
 
 
 # ==================== MAIN ====================
@@ -409,7 +489,7 @@ def main():
     try:
         # 1. Initialize Git repo
         git_repo = GitRepo(".")
-        log("Pulling latest changes (main branch)...")
+        log("Pulling latest main branch...")
         git_repo.pull()
 
         # 2. Browser (if requested)
@@ -423,14 +503,16 @@ def main():
         else:
             log("Running without browser.")
 
-        # 3. Orchestrate client/server task
-        execute_task(git_repo, browser, page, scheduler)
+        # 3. Enter infinite orchestration loop (blocks until manual stop)
+        orchestrate_loop(git_repo, browser, page, scheduler)
 
+    except KeyboardInterrupt:
+        log("Manual stop requested.")
     except Exception as e:
         log(f"Fatal error in main: {e}")
         traceback.print_exc()
     finally:
-        # Cleanup: empty both client and server branches completely
+        # ALWAYS empty both client and server branches
         if git_repo:
             for branch in ['client', 'server']:
                 try:
