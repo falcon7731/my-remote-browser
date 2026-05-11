@@ -43,9 +43,5 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-      # (Optional) Prevent the browser profile from ever being committed
-      - name: Add .gitignore for browser profile
-        run: echo "browser_profile/" >> .gitignore
-
       - name: Run script (with browser)
         run: python repo_and_browser_tool.py --browser --headless

@@ -208,12 +208,15 @@ class GitRepo:
         log(f"[Git] Shallow fetch {branch}")
 
     def shallow_pull(self, branch="main"):
-        """Shallow pull (depth=1) for the given branch. Ignores errors if branch doesn't exist yet."""
+        """Force local branch to exactly match remote (shallow, no history)."""
         try:
-            self.repo.git.pull("--depth", "1", "origin", branch)
-            log(f"[Git] Shallow pull of '{branch}' done.")
+            # Fetch only the latest commit of the remote branch
+            self.repo.git.fetch("--depth", "1", "origin", branch)
+            # Force local branch to point to the fetched commit
+            self.repo.git.reset("--hard", f"origin/{branch}")
+            log(f"[Git] Force reset to origin/{branch} (shallow).")
         except GitCommandError as e:
-            log(f"[Git] Shallow pull of '{branch}' failed (maybe no remote?): {e}")
+            log(f"[Git] Shallow reset failed for '{branch}': {e}")
 
     def check_branch_update(self, branch="main"):
         self.origin.fetch()
