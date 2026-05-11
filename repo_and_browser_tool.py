@@ -305,7 +305,10 @@ class GitRepo:
 # ==================== USER RUN FUNCTION ====================
 def run(browser, git_repo, page, scheduler):
     """
-    Actions‑friendly automation with error logging.
+    Actions‑friendly automation:
+      1. Go to YouTube (headless)
+      2. Save screenshot (youtube.png)
+      3. Force‑push to the 'season' branch (overwrites remote)
     """
     log("=== run() started ===")
     if browser is None or page is None:
@@ -313,26 +316,27 @@ def run(browser, git_repo, page, scheduler):
         return
 
     try:
-        # 1. Navigate to YouTube (timeout 60s, networkidle optional)
+        # 1. Navigate to YouTube
         log("Navigating to YouTube...")
         browser.goto(page, "https://www.youtube.com")
-        loaded = wait_for_page_loaded(page, timeout=60000, wait_for_network_idle=False)  # YouTube rarely idles
+        loaded = wait_for_page_loaded(page, timeout=60000, wait_for_network_idle=False)
         log(f"Page loaded successfully: {loaded}")
 
         # 2. Screenshot
         screenshot_file = "youtube.png"
         browser.screenshot(page, screenshot_file)
 
-        # 3. Git operations
-        log("Switching to 'season' branch (force recreate)...")
+        # 3. Git operations – force push to override old 'season' branch
+        log("Force‑recreating 'season' branch...")
         git_repo.repo.git.checkout('-B', 'season')
         log("Staging changes...")
         git_repo.add_all()
         log("Committing...")
         git_repo.commit("Add YouTube screenshot")
-        log("Pushing to origin/season...")
-        git_repo.repo.git.push('--set-upstream', 'origin', 'season')
-        log("✅ Screenshot pushed to 'season' branch.")
+        log("Force pushing to origin/season...")
+        # Use --force and --set-upstream to overwrite the remote branch
+        git_repo.repo.git.push('--set-upstream', '--force', 'origin', 'season')
+        log("✅ Screenshot force‑pushed to 'season' branch.")
     except Exception as e:
         log(f"❌ Exception in run(): {e}")
         tb = traceback.format_exc()
