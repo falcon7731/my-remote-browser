@@ -5,7 +5,7 @@ All output goes to both console and a 'debug.log' file.
 On any error, a traceback is written to 'error.log'.
 """
 
-import os, sys, time, traceback, threading, argparse
+import os, sys, time, traceback, threading, argparse, shutil
 from git import Repo, GitCommandError
 
 # ---------- Playwright import ----------
@@ -191,6 +191,12 @@ def wait_for_element(page, selector, timeout=10000):
         log(f"[Page] Element '{selector}' not visible.")
         return False
 
+def wait_timeout(page, seconds):
+    """Wait a fixed amount of time (in seconds)."""
+    log(f"[Page] Waiting {seconds} seconds...")
+    page.wait_for_timeout(seconds * 1000)
+    log("[Page] Fixed wait done.")
+
 
 # ==================== GIT OPERATIONS (debug added) ====================
 class GitRepo:
@@ -293,9 +299,48 @@ class GitRepo:
         self.push(force=True)
         log("[Git] add + commit + force push done.")
 
+    def reset_branch_to_log(self, branch_name="season"):
+        """
+        Resets the given branch to contain ONLY debug.log in a single commit.
+        - Force‑recreates the branch locally
+        - Deletes all files except debug.log and .git
+        - Commits debug.log
+        - Force‑pushes (replaces remote history completely)
+        """
+        log(f"[Git] Cleanup: resetting '{branch_name}' branch to log file only...")
+        try:
+            # Force‑create/switch to the branch
+            self.repo.git.checkout('-B', branch_name)
+
+            # Delete all files/folders except .git and debug.log
+            for item in os.listdir('.'):
+                if item not in ('.git', 'debug.log'):
+                    full_path = os.path.join('.', item)
+                    if os.path.isfile(full_path) or os.path.islink(full_path):
+                        os.remove(full_path)
+                    elif os.path.isdir(full_path):
+                        shutil.rmtree(full_path)
+
+            # Ensure debug.log exists (create an empty one if it doesn't)
+            if not os.path.exists('debug.log'):
+                with open('debug.log', 'w') as f:
+                    f.write('')
+
+            # Stage only debug.log
+            self.repo.git.add('debug.log')
+
+            # Commit (even if nothing changed, force a new commit)
+            self.repo.index.commit("Cleanup: keep only debug.log")
+
+            # Force push to overwrite remote history
+            self.repo.git.push('--force', '--set-upstream', 'origin', branch_name)
+            log(f"[Git] Cleanup complete. '{branch_name}' now contains only debug.log.")
+        except Exception as e:
+            log(f"[Git] Cleanup failed: {e}")
+            traceback.print_exc()
+
     @staticmethod
     def shallow_clone(repo_url, target_dir=".", branch="main"):
-        import shutil
         if os.path.exists(target_dir):
             shutil.rmtree(target_dir)
         Repo.clone_from(repo_url, target_dir, branch=branch, depth=1)
@@ -318,9 +363,12 @@ def run(browser, git_repo, page, scheduler):
     try:
         # 1. Navigate to YouTube
         log("Navigating to YouTube...")
-        browser.goto(page, "https://www.xvideos.com/")
+        browser.goto(page, "https://www.youtube.com")
         loaded = wait_for_page_loaded(page, timeout=60000, wait_for_network_idle=False)
         log(f"Page loaded successfully: {loaded}")
+
+        # Give the page extra time for lazy‑loaded icons / thumbnails to appear
+        wait_timeout(page, 10)
 
         # 2. Screenshot
         screenshot_file = "youtube.png"
@@ -403,8 +451,18 @@ def main():
         # Already logged in run()
         sys.exit(1)
     finally:
+        # Cleanup the season branch – remove everything except logs
+        if git_repo:
+            try:
+                git_repo.reset_branch_to_log('season')
+            except Exception as cleanup_error:
+                log(f"Branch cleanup threw an exception: {cleanup_error}")
+
         if browser:
-            browser.stop()
+            try:
+                browser.stop()
+            except Exception:
+                pass
 
     log("===== Script finished successfully =====")
 
