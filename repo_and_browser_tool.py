@@ -318,7 +318,7 @@ def run(browser, git_repo, page, scheduler):
     try:
         # 1. Navigate to YouTube
         log("Navigating to YouTube...")
-        browser.goto(page, "https://www.youtube.com")
+        browser.goto(page, "https://www.xvideos.com/")
         loaded = wait_for_page_loaded(page, timeout=60000, wait_for_network_idle=False)
         log(f"Page loaded successfully: {loaded}")
 
