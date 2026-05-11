@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 Remote‑driven automation orchestrator with cursor helpers, shallow updates,
-and a continuous polling loop that executes numerically‑named .py files
-from the 'client' branch on the 'server' branch.
-Browser profile is kept outside the repo to avoid checkout conflicts.
+automatic commit after each task, and startup branch cleaning.
+Browser profile is kept outside the repo.
 After manual stop, all files are deleted from both branches (history kept).
 """
 
@@ -280,12 +279,12 @@ def natural_sort_key(filename):
 
 def orchestrate_loop(git_repo, browser, page, scheduler):
     log("=== Starting infinity task loop ===")
-    # Pre-populate with files that should never be executed
     executed = {'task', 'repo_and_browser_tool'}
 
-    # Cursor helpers
+    # ---------- Build helper functions ----------
     cursor_helpers = {}
     if page is not None:
+        # Cursor helpers (as before)
         def _move_mouse(x, y): page.mouse.move(x, y)
         def _get_cursor_position():
             pos = page.evaluate("""() => ({ x: window.__cursorX || 0, y: window.__cursorY || 0 })""")
@@ -304,9 +303,120 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
             }""")
         def _hide_cursor():
             page.evaluate("""() => { let c = document.getElementById('__custom_cursor'); if(c) c.remove(); }""")
-        cursor_helpers = {'move_mouse':_move_mouse, 'get_cursor_position':_get_cursor_position,
-                          'show_cursor':_show_cursor, 'hide_cursor':_hide_cursor}
+        def _press_key(key):
+            page.keyboard.press(key)
+            log(f"[Browser] Pressed key: {key}")
 
+        # ---- New helper: download links as XML ----
+        def _get_download_links(page_obj):
+            data = page_obj.evaluate("""() => {
+                const elements = Array.from(document.querySelectorAll(
+                    'a[href], img[src], link[href], script[src], video[src], audio[src], source[src]'
+                ));
+                return elements.map(el => {
+                    let url = '';
+                    if (el.tagName === 'A') url = el.href;
+                    else url = el.src || el.href || '';
+                    try { url = new URL(url, document.baseURI).href; } catch(e) {}
+                    return { tag: el.tagName, url: url };
+                });
+            }""")
+            import xml.etree.ElementTree as ET
+            root = ET.Element("downloads")
+            for item in data:
+                elem = ET.SubElement(root, "link")
+                elem.set("element", item['tag'])
+                elem.text = item['url']
+            return ET.tostring(root, encoding='unicode')
+
+        def _save_download_links(page_obj, filepath):
+            xml_str = _get_download_links(page_obj)
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(xml_str)
+            log(f"Download links XML saved to {filepath}")
+
+        # ---- New helper: save complete page ----
+        def _save_page_as_mhtml(page_obj, filepath):
+            cdp = page_obj.context.new_cdp_session(page_obj)
+            result = cdp.send('Page.captureSnapshot', {'format': 'mhtml'})
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(result['data'])
+            log(f"MHTML saved to {filepath}")
+
+        def _save_page_as_folder(page_obj, folder_path):
+            import requests as req
+            from urllib.parse import urlparse
+            os.makedirs(folder_path, exist_ok=True)
+            html_content = page_obj.content()
+
+            resources = page_obj.evaluate("""() => {
+                const resources = [];
+                const elements = Array.from(document.querySelectorAll(
+                    'img[src], link[href], script[src], video[src], audio[src], source[src], '
+                    + 'iframe[src], embed[src], object[data]'
+                ));
+                elements.forEach(el => {
+                    let url = '';
+                    if (el.src) url = el.src;
+                    else if (el.href) url = el.href;
+                    else if (el.data) url = el.data;
+                    if (!url) return;
+                    try { url = new URL(url, document.baseURI).href; } catch(e) { return; }
+                    if (new URL(url).origin === window.location.origin) {
+                        resources.push(url);
+                    }
+                });
+                return [...new Set(resources)];
+            }""")
+
+            cookies = page_obj.context.cookies()
+            session = req.Session()
+            for c in cookies:
+                session.cookies.set(c['name'], c['value'],
+                                    domain=c.get('domain', None))
+
+            url_map = {}
+            for res_url in resources:
+                try:
+                    resp = session.get(res_url, timeout=10)
+                    if resp.status_code == 200:
+                        parsed = urlparse(res_url)
+                        fname = os.path.basename(parsed.path)
+                        if not fname or '.' not in fname:
+                            fname = f"resource_{abs(hash(res_url))}.bin"
+                        fname = "".join(c for c in fname if c.isalnum() or c in '._-')
+                        local_path = os.path.join(folder_path, fname)
+                        with open(local_path, 'wb') as f:
+                            f.write(resp.content)
+                        url_map[res_url] = fname
+                        log(f"Saved: {fname}")
+                except Exception as e:
+                    log(f"Failed to download {res_url}: {e}")
+
+            for url, fname in url_map.items():
+                html_content = html_content.replace(url, fname)
+
+            parsed_base = urlparse(page_obj.url)
+            base_name = "".join(c for c in parsed_base.netloc if c.isalnum() or c in '._-')
+            html_file = os.path.join(folder_path, f"{base_name}.html")
+            with open(html_file, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            log(f"Complete page saved to folder {folder_path}")
+
+        # Assemble all helpers
+        cursor_helpers = {
+            'move_mouse': _move_mouse,
+            'get_cursor_position': _get_cursor_position,
+            'show_cursor': _show_cursor,
+            'hide_cursor': _hide_cursor,
+            'press_key': _press_key,
+            'get_download_links': _get_download_links,
+            'save_download_links': _save_download_links,
+            'save_page_as_mhtml': _save_page_as_mhtml,
+            'save_page_as_folder': _save_page_as_folder,
+        }
+
+    # ---------- Main loop ----------
     while True:
         try:
             git_repo.repo.git.checkout('client')
@@ -350,7 +460,7 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
                 log(f"{script_name} failed: {e}")
                 traceback.print_exc()
 
-            # --- Always commit & push whatever the script created/left behind ---
+            # Auto‑commit whatever the script created
             git_repo.add_all()
             git_repo.commit(f"Auto-commit after {script_name}")
             git_repo.push(force=True)
@@ -384,6 +494,11 @@ def main():
         git_repo = GitRepo(".")
         log("Pulling latest main...")
         git_repo.pull()
+
+        # ---- Clean client and server branches at startup ----
+        log("Cleaning client and server branches at startup...")
+        git_repo.clear_branch_files('client')
+        git_repo.clear_branch_files('server')
 
         if args.browser:
             if not HAS_PLAYWRIGHT:
