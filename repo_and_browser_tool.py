@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-All-in-one script with full debug logging.
-All output goes to both console and a 'debug.log' file.
-On any error, a traceback is written to 'error.log'.
+Remote-driven automation script.
+- Reads task code from the 'client' branch (task.py)
+- Executes it on the 'server' branch (with browser, git, etc.)
+- After execution (success or failure), both branches are emptied completely.
+All output is printed to the console (no log files).
 """
 
 import os, sys, time, traceback, threading, argparse, shutil
@@ -15,25 +17,15 @@ try:
 except ImportError:
     HAS_PLAYWRIGHT = False
 
-# ==================== DEBUG LOGGING ====================
-LOG_FILE = "debug.log"
-
+# ==================== CONSOLE LOGGING ONLY ====================
 def log(msg: str):
-    """Print to stdout and append to log file."""
+    """Print message to stdout (no file logging)."""
     print(msg, flush=True)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(msg + "\n")
 
-# Clear log file at start
-if os.path.exists(LOG_FILE):
-    os.remove(LOG_FILE)
-
-# Capture unhandled exceptions globally
+# Global exception handler (prints traceback, no file write)
 def global_exception_handler(exc_type, exc_value, exc_tb):
     tb_str = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
     log(f"FATAL UNHANDLED EXCEPTION:\n{tb_str}")
-    with open("error.log", "w") as f:
-        f.write(tb_str)
 
 sys.excepthook = global_exception_handler
 
@@ -163,17 +155,12 @@ class StealthBrowser:
 
 # ------------------ Page loading helpers ------------------
 def wait_for_page_loaded(page, timeout=60000, wait_for_network_idle=True):
-    """
-    Wait for page load. Timeout increased to 60s.
-    If networkidle fails, log and continue.
-    """
     try:
         page.wait_for_load_state("load", timeout=timeout)
         log("[Page] 'load' event fired.")
     except Exception as e:
         log(f"[Page] 'load' timeout/error: {e}")
         return False
-
     if wait_for_network_idle:
         try:
             page.wait_for_load_state("networkidle", timeout=timeout)
@@ -192,13 +179,12 @@ def wait_for_element(page, selector, timeout=10000):
         return False
 
 def wait_timeout(page, seconds):
-    """Wait a fixed amount of time (in seconds)."""
     log(f"[Page] Waiting {seconds} seconds...")
     page.wait_for_timeout(seconds * 1000)
     log("[Page] Fixed wait done.")
 
 
-# ==================== GIT OPERATIONS (debug added) ====================
+# ==================== GIT OPERATIONS ====================
 class GitRepo:
     """Wrapper for Git operations (no REST API)."""
     def __init__(self, repo_path="."):
@@ -230,7 +216,7 @@ class GitRepo:
         log(f"[Git] Shallow pull {branch}")
 
     def check_branch_update(self, branch="main"):
-        self.origin.fetch()  # Git transport
+        self.origin.fetch()
         try:
             local_commit = self.repo.head.commit
             remote_commit = self.repo.refs[f"origin/{branch}"].commit
@@ -299,104 +285,115 @@ class GitRepo:
         self.push(force=True)
         log("[Git] add + commit + force push done.")
 
-    def reset_branch_to_log(self, branch_name="season"):
-        """
-        Resets the given branch to contain ONLY debug.log in a single commit.
-        - Force‑recreates the branch locally
-        - Deletes all files except debug.log and .git
-        - Commits debug.log
-        - Force‑pushes (replaces remote history completely)
-        """
-        log(f"[Git] Cleanup: resetting '{branch_name}' branch to log file only...")
+    def _empty_orphan_branch(self, branch_name):
+        """Create (or reset) an orphan branch, delete all content, commit empty, force push."""
+        log(f"[Git] Orphaning branch '{branch_name}'...")
+        # Create an orphan branch (no parent)
+        self.repo.git.checkout('--orphan', branch_name)
+        # Delete all files except .git
+        for item in os.listdir('.'):
+            if item != '.git':
+                full_path = os.path.join('.', item)
+                if os.path.isfile(full_path) or os.path.islink(full_path):
+                    os.remove(full_path)
+                elif os.path.isdir(full_path):
+                    shutil.rmtree(full_path)
+        # Commit empty (allow empty)
+        self.repo.git.commit('--allow-empty', '-m', 'Empty branch')
+        # Force push to overwrite remote
+        self.repo.git.push('--force', '--set-upstream', 'origin', branch_name)
+        log(f"[Git] Branch '{branch_name}' is now empty (orphaned).")
+
+
+# ==================== TASK EXECUTION LOGIC ====================
+def execute_task(git_repo, browser, page, scheduler):
+    """
+    Reads task.py from the 'client' branch, then executes it on the 'server' branch.
+    Access to all helper objects is provided.
+    """
+    log("=== Starting task orchestration ===")
+
+    # 1. Fetch all branches (so we can see client & server)
+    log("Fetching all branches...")
+    git_repo.origin.fetch()
+
+    # 2. Checkout client branch and read task file
+    try:
+        git_repo.repo.git.checkout('client')
+    except GitCommandError:
+        # If client branch doesn't exist locally, create it from origin/client?
+        # Try to fetch and checkout again, or just create a new empty one.
+        log("Client branch not found locally, trying to create from remote...")
         try:
-            # Force‑create/switch to the branch
-            self.repo.git.checkout('-B', branch_name)
+            git_repo.repo.git.checkout('-b', 'client', 'origin/client')
+        except GitCommandError:
+            log("No remote client branch either. Skipping task execution.")
+            return
 
-            # Delete all files/folders except .git and debug.log
-            for item in os.listdir('.'):
-                if item not in ('.git', 'debug.log'):
-                    full_path = os.path.join('.', item)
-                    if os.path.isfile(full_path) or os.path.islink(full_path):
-                        os.remove(full_path)
-                    elif os.path.isdir(full_path):
-                        shutil.rmtree(full_path)
-
-            # Ensure debug.log exists (create an empty one if it doesn't)
-            if not os.path.exists('debug.log'):
-                with open('debug.log', 'w') as f:
-                    f.write('')
-
-            # Stage only debug.log
-            self.repo.git.add('debug.log')
-
-            # Commit (even if nothing changed, force a new commit)
-            self.repo.index.commit("Cleanup: keep only debug.log")
-
-            # Force push to overwrite remote history
-            self.repo.git.push('--force', '--set-upstream', 'origin', branch_name)
-            log(f"[Git] Cleanup complete. '{branch_name}' now contains only debug.log.")
-        except Exception as e:
-            log(f"[Git] Cleanup failed: {e}")
-            traceback.print_exc()
-
-    @staticmethod
-    def shallow_clone(repo_url, target_dir=".", branch="main"):
-        if os.path.exists(target_dir):
-            shutil.rmtree(target_dir)
-        Repo.clone_from(repo_url, target_dir, branch=branch, depth=1)
-        log(f"[Git] Shallow clone into '{target_dir}'.")
-
-
-# ==================== USER RUN FUNCTION ====================
-def run(browser, git_repo, page, scheduler):
-    """
-    Actions‑friendly automation:
-      1. Go to YouTube (headless)
-      2. Save screenshot (youtube.png)
-      3. Force‑push to the 'season' branch (overwrites remote)
-    """
-    log("=== run() started ===")
-    if browser is None or page is None:
-        log("❌ Browser not available. Exiting run().")
+    task_file = "task.py"
+    if not os.path.isfile(task_file):
+        log(f"No {task_file} found on client branch. Nothing to execute.")
         return
 
+    with open(task_file, "r", encoding="utf-8") as f:
+        task_code = f.read()
+    log("Task code loaded from client branch.")
+
+    # 3. Switch to server branch (create if not exists)
     try:
-        # 1. Navigate to YouTube
-        log("Navigating to YouTube...")
-        browser.goto(page, "https://www.youtube.com")
-        loaded = wait_for_page_loaded(page, timeout=60000, wait_for_network_idle=False)
-        log(f"Page loaded successfully: {loaded}")
+        git_repo.repo.git.checkout('server')
+    except GitCommandError:
+        log("Server branch not found locally, creating from remote or empty...")
+        try:
+            git_repo.repo.git.checkout('-b', 'server', 'origin/server')
+        except GitCommandError:
+            log("Creating a new empty server branch.")
+            git_repo._empty_orphan_branch('server')  # but we need to stay on server
+            # after emptying, we are on server. The _empty_orphan_branch does a commit+push.
+            # But we don't want to push now, just have a clean environment.
+            # Actually, we'll just use _empty_orphan_branch for cleanup later; for now just create orphan locally.
+            # Better: just checkout a new orphan branch without pushing.
+            git_repo.repo.git.checkout('--orphan', 'server')
+            git_repo.repo.git.rm('-rf', '--cached', '.')
+            # Clean working tree
+            for item in os.listdir('.'):
+                if item != '.git':
+                    full = os.path.join('.', item)
+                    if os.path.isfile(full) or os.path.islink(full):
+                        os.remove(full)
+                    elif os.path.isdir(full):
+                        shutil.rmtree(full)
+            git_repo.repo.git.commit('--allow-empty', '-m', 'Empty server branch')
 
-        # Give the page extra time for lazy‑loaded icons / thumbnails to appear
-        wait_timeout(page, 10)
+    log("Ready to execute task on server branch.")
 
-        # 2. Screenshot
-        screenshot_file = "youtube.png"
-        browser.screenshot(page, screenshot_file)
-
-        # 3. Git operations – force push to override old 'season' branch
-        log("Force‑recreating 'season' branch...")
-        git_repo.repo.git.checkout('-B', 'season')
-        log("Staging changes...")
-        git_repo.add_all()
-        log("Committing...")
-        git_repo.commit("Add YouTube screenshot")
-        log("Force pushing to origin/season...")
-        # Use --force and --set-upstream to overwrite the remote branch
-        git_repo.repo.git.push('--set-upstream', '--force', 'origin', 'season')
-        log("✅ Screenshot force‑pushed to 'season' branch.")
+    # 4. Execute the task code, providing all helpers
+    task_globals = {
+        'browser': browser,
+        'page': page,
+        'git_repo': git_repo,
+        'scheduler': scheduler,
+        'log': log,
+        'wait_for_page_loaded': wait_for_page_loaded,
+        'wait_for_element': wait_for_element,
+        'wait_timeout': wait_timeout,
+        # optionally add other useful modules
+        'time': time,
+        'os': os,
+        'sys': sys,
+    }
+    try:
+        exec(compile(task_code, 'task.py', 'exec'), task_globals)
+        log("Task executed successfully.")
     except Exception as e:
-        log(f"❌ Exception in run(): {e}")
-        tb = traceback.format_exc()
-        log(tb)
-        with open("error.log", "w") as f:
-            f.write(tb)
-        raise
+        log(f"Task execution failed: {e}")
+        traceback.print_exc()
+        # Don't re-raise; we still want cleanup to run
 
-    log("=== run() finished ===")
+    log("=== Task orchestration finished ===")
 
 
-# ==================== MAIN ENTRY POINT ====================
+# ==================== MAIN ====================
 def main():
     log("===== Script started =====")
     parser = argparse.ArgumentParser()
@@ -404,59 +401,42 @@ def main():
     parser.add_argument("--headless", action="store_true", help="Headless mode")
     args = parser.parse_args()
 
-    # 1. Initialize Git repo
-    try:
-        git_repo = GitRepo(".")
-    except Exception as e:
-        log(f"Git init error: {e}")
-        sys.exit(1)
-
-    # 2. Pull latest (zero API)
-    log("Pulling latest changes...")
-    try:
-        pulled = git_repo.pull()
-        if pulled:
-            changes = git_repo.check_branch_update()
-            if changes:
-                log(f"Remote changes: {changes}")
-    except Exception as e:
-        log(f"Pull failed: {e}")
-        # Continue anyway – the script can still work with local state
-
-    # 3. Browser (if requested)
+    git_repo = None
     browser = None
     page = None
-    if args.browser:
-        if not HAS_PLAYWRIGHT:
-            log("Playwright not installed. Exiting.")
-            sys.exit(1)
-        browser = StealthBrowser(headless=args.headless)
-        try:
-            browser.start()
-            page = browser.new_page()
-        except Exception as e:
-            log(f"Browser start failed: {e}")
-            log(traceback.format_exc())
-            sys.exit(1)
-    else:
-        log("Running without browser.")
-
-    # 4. Create scheduler
     scheduler = TaskScheduler()
 
-    # 5. Call run() and ensure cleanup
     try:
-        run(browser, git_repo, page, scheduler)
-    except Exception:
-        # Already logged in run()
-        sys.exit(1)
+        # 1. Initialize Git repo
+        git_repo = GitRepo(".")
+        log("Pulling latest changes (main branch)...")
+        git_repo.pull()
+
+        # 2. Browser (if requested)
+        if args.browser:
+            if not HAS_PLAYWRIGHT:
+                log("Playwright not installed. Exiting.")
+                sys.exit(1)
+            browser = StealthBrowser(headless=args.headless)
+            browser.start()
+            page = browser.new_page()
+        else:
+            log("Running without browser.")
+
+        # 3. Orchestrate client/server task
+        execute_task(git_repo, browser, page, scheduler)
+
+    except Exception as e:
+        log(f"Fatal error in main: {e}")
+        traceback.print_exc()
     finally:
-        # Cleanup the season branch – remove everything except logs
+        # Cleanup: empty both client and server branches completely
         if git_repo:
-            try:
-                git_repo.reset_branch_to_log('season')
-            except Exception as cleanup_error:
-                log(f"Branch cleanup threw an exception: {cleanup_error}")
+            for branch in ['client', 'server']:
+                try:
+                    git_repo._empty_orphan_branch(branch)
+                except Exception as e:
+                    log(f"Failed to empty branch '{branch}': {e}")
 
         if browser:
             try:
@@ -464,7 +444,7 @@ def main():
             except Exception:
                 pass
 
-    log("===== Script finished successfully =====")
+        log("===== Script finished =====")
 
 
 if __name__ == "__main__":
