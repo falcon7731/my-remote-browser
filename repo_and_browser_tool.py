@@ -280,7 +280,8 @@ def natural_sort_key(filename):
 
 def orchestrate_loop(git_repo, browser, page, scheduler):
     log("=== Starting infinity task loop ===")
-    executed = set()
+    # Pre-populate with files that should never be executed
+    executed = {'task', 'repo_and_browser_tool'}
 
     # Cursor helpers
     cursor_helpers = {}
@@ -348,6 +349,12 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
             except Exception as e:
                 log(f"{script_name} failed: {e}")
                 traceback.print_exc()
+
+            # --- Always commit & push whatever the script created/left behind ---
+            git_repo.add_all()
+            git_repo.commit(f"Auto-commit after {script_name}")
+            git_repo.push(force=True)
+            log("Pushed changes to server branch.")
 
             executed.add(script_stem)
             log(f"Marked {script_name} as executed. Total: {len(executed)}")
