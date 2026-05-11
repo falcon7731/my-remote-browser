@@ -37,43 +37,15 @@ jobs:
           pip install --upgrade gitpython playwright requests
           playwright install --with-deps chromium
 
-      - name: Verify workspace and script presence
+      # 🌟 Set Git identity so commits work
+      - name: Configure Git
         run: |
-          echo "Current directory: $(pwd)"
-          echo "Files in root:"
-          ls -la
-          if [ -f repo_and_browser_tool.py ]; then
-            echo "✅ Script found."
-          else
-            echo "❌ Script missing!"
-            exit 1
-          fi
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Run script (with debug)
-        id: run_script
-        run: |
-          python repo_and_browser_tool.py --browser --headless
-        continue-on-error: true   # We'll upload logs even if it fails
+      # (Optional) Prevent the browser profile from ever being committed
+      - name: Add .gitignore for browser profile
+        run: echo "browser_profile/" >> .gitignore
 
-      - name: Show log files
-        if: always()
-        run: |
-          echo "=== debug.log ==="
-          cat debug.log || echo "No debug.log"
-          echo "=== error.log ==="
-          cat error.log || echo "No error.log"
-
-      - name: Upload debug logs as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-logs
-          path: |
-            debug.log
-            error.log
-            youtube.png
-          if-no-files-found: ignore
-
-      - name: Fail the job if script failed
-        if: steps.run_script.outcome == 'failure'
-        run: exit 1
+      - name: Run script (with browser)
+        run: python repo_and_browser_tool.py --browser --headless

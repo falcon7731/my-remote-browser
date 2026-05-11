@@ -181,11 +181,6 @@ def wait_timeout(page, seconds):
     log("[Page] Fixed wait done.")
 
 
-# ------------------ Cursor helpers (injected into tasks) ------------------
-# These are defined inside the orchestration loop because they need the live `page` object.
-# We'll create them later and inject them into task_globals.
-
-
 # ==================== GIT OPERATIONS ====================
 class GitRepo:
     def __init__(self, repo_path="."):
@@ -329,20 +324,16 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
     # ---------- Build cursor helper functions (if browser is active) ----------
     cursor_helpers = {}
     if page is not None:
-        # We'll define them here and later inject them into task_globals.
         def _move_mouse(x, y):
             page.mouse.move(x, y)
 
         def _get_cursor_position():
-            # The position is tracked inside the page via a mousemove listener.
-            # We retrieve it from a global variable set by show_cursor.
             pos = page.evaluate("""() => {
                 return { x: window.__cursorX || 0, y: window.__cursorY || 0 };
             }""")
             return pos['x'], pos['y']
 
         def _show_cursor():
-            # Inject a visible cursor element that follows the mouse and shows in screenshots.
             page.evaluate("""() => {
                 if (document.getElementById('__custom_cursor')) return;
                 let cursor = document.createElement('div');
@@ -382,22 +373,7 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
     while True:
         try:
             # ----- 1. Switch to client + shallow update -----
-            try:
-                git_repo.repo.git.checkout('client')
-            except GitCommandError:
-                log("Client branch missing. Creating empty one locally (will push later).")
-                git_repo.repo.git.checkout('--orphan', 'client')
-                git_repo.repo.git.rm('-rf', '--cached', '.')
-                for item in os.listdir('.'):
-                    if item != '.git':
-                        full = os.path.join('.', item)
-                        if os.path.isfile(full) or os.path.islink(full): os.remove(full)
-                        elif os.path.isdir(full): shutil.rmtree(full)
-                git_repo.repo.git.commit('--allow-empty', '-m', 'Empty client branch')
-                # Push so remote knows about it (only once)
-                git_repo.repo.git.push('--force', '--set-upstream', 'origin', 'client')
-
-            # Shallow update: pull latest files only
+            git_repo.repo.git.checkout('client')
             git_repo.shallow_pull('client')
 
             # ----- 2. Discover unexecuted scripts -----
@@ -420,21 +396,7 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
                 code = f.read()
 
             # ----- 3. Switch to server + shallow update -----
-            try:
-                git_repo.repo.git.checkout('server')
-            except GitCommandError:
-                log("Server branch missing. Creating empty locally.")
-                git_repo.repo.git.checkout('--orphan', 'server')
-                git_repo.repo.git.rm('-rf', '--cached', '.')
-                for item in os.listdir('.'):
-                    if item != '.git':
-                        full = os.path.join('.', item)
-                        if os.path.isfile(full) or os.path.islink(full): os.remove(full)
-                        elif os.path.isdir(full): shutil.rmtree(full)
-                git_repo.repo.git.commit('--allow-empty', '-m', 'Empty server branch')
-                # push
-                git_repo.repo.git.push('--force', '--set-upstream', 'origin', 'server')
-
+            git_repo.repo.git.checkout('server')
             git_repo.shallow_pull('server')
 
             # ----- 4. Execute script -----
@@ -481,6 +443,10 @@ def main():
     parser.add_argument("--headless", action="store_true", help="Headless mode")
     args = parser.parse_args()
 
+    # Ensure Git identity is set (fallback in case workflow didn't)
+    os.system('git config user.name "github-actions[bot]"')
+    os.system('git config user.email "github-actions[bot]@users.noreply.github.com"')
+
     git_repo = None
     browser = None
     page = None
@@ -492,7 +458,12 @@ def main():
         log("Pulling latest main branch...")
         git_repo.pull()
 
-        # 2. Browser (if requested)
+        # 2. Bootstrap: force both branches to be empty orphans (no history, no files)
+        log("Initialising empty client & server branches...")
+        git_repo._empty_orphan_branch('client')
+        git_repo._empty_orphan_branch('server')
+
+        # 3. Browser (if requested)
         if args.browser:
             if not HAS_PLAYWRIGHT:
                 log("Playwright not installed. Exiting.")
@@ -503,7 +474,7 @@ def main():
         else:
             log("Running without browser.")
 
-        # 3. Enter infinite orchestration loop (blocks until manual stop)
+        # 4. Enter infinite orchestration loop (blocks until manual stop)
         orchestrate_loop(git_repo, browser, page, scheduler)
 
     except KeyboardInterrupt:
