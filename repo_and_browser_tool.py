@@ -330,35 +330,36 @@ class GitRepo:
         self.repo.git.checkout(original_branch)
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    def pull_session_files(self, session_dir, branch="Seasions"):
-        """
-        Pull the browser session files from the isolated branch.
-        If the branch doesn't exist yet, do nothing.
-        """
-        log(f"[Git] Pulling session files from '{branch}'...")
-        try:
-            self.origin.fetch("--depth", "1", "origin", branch)
-            # Checkout the remote branch content into the working tree
-            self.repo.git.checkout(f"origin/{branch}", "--", ".")
-        except GitCommandError:
-            log(f"[Git] No remote '{branch}' branch yet.")
-            return
+        def pull_session_files(self, session_dir, branch="Seasions"):
+            """
+            Pull the browser session files from the isolated branch.
+            If the branch doesn't exist yet, do nothing.
+            """
+            log(f"[Git] Pulling session files from '{branch}'...")
+            try:
+                # Correct: pass depth as keyword, fetch remote/branch
+                self.origin.fetch('origin', branch, depth=1)
+                # Checkout the remote branch content into the working tree
+                self.repo.git.checkout(f"origin/{branch}", "--", ".")
+            except GitCommandError:
+                log(f"[Git] No remote '{branch}' branch yet.")
+                return
 
-        # Copy everything from working tree (now session files) to session_dir
-        os.makedirs(session_dir, exist_ok=True)
-        for item in os.listdir('.'):
-            if item == '.git' or item == 'browser_profile':
-                continue
-            src = os.path.join('.', item)
-            dst = os.path.join(session_dir, item)
-            if os.path.isfile(src):
-                shutil.copy2(src, dst)
-            elif os.path.isdir(src):
-                shutil.copytree(src, dst)
-        log("[Git] Session files restored to browser profile.")
+            # Copy everything from working tree (now session files) to session_dir
+            os.makedirs(session_dir, exist_ok=True)
+            for item in os.listdir('.'):
+                if item == '.git' or item == 'browser_profile':
+                    continue
+                src = os.path.join('.', item)
+                dst = os.path.join(session_dir, item)
+                if os.path.isfile(src):
+                    shutil.copy2(src, dst)
+                elif os.path.isdir(src):
+                    shutil.copytree(src, dst)
+            log("[Git] Session files restored to browser profile.")
 
-        # Reset working tree to a clean state (undo the checkout)
-        self.repo.git.checkout('--', '.')
+            # Reset working tree to a clean state (undo the checkout)
+            self.repo.git.checkout('--', '.')
 
 
 # ==================== TASK ORCHESTRATION LOOP ====================
