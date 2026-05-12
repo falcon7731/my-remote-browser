@@ -2,9 +2,10 @@
 setlocal enabledelayedexpansion
 
 echo ==============================================
-echo  This will EMPTY the 'client' and 'server'
-echo  branches completely (no files, no history).
-echo  The branches will still exist, but be empty.
+echo  SAFE branch resetter
+echo  This will make 'client' and 'server' branches
+echo  completely empty (no files, no history).
+echo  Your current branch will NOT be modified.
 echo ==============================================
 set /p confirm="Type 'yes' to continue: "
 if /i not "%confirm%"=="yes" (
@@ -12,46 +13,42 @@ if /i not "%confirm%"=="yes" (
     exit /b
 )
 
+:: Save the current branch so we can return to it
+for /f "tokens=*" %%a in ('git rev-parse --abbrev-ref HEAD') do set "ORIG_BRANCH=%%a"
+
+:: Fetch remote info (needed to see if branches exist)
 echo.
 echo Fetching latest remote info...
 git fetch origin
 
-:: Save current branch to return to later
-for /f "tokens=*" %%a in ('git rev-parse --abbrev-ref HEAD') do set "ORIG_BRANCH=%%a"
-
 :: Function to empty a branch
-call :empty_branch client
-call :empty_branch server
-
-echo.
-echo Returning to original branch: %ORIG_BRANCH%
-git checkout %ORIG_BRANCH%
-
-echo.
-echo Done! 'client' and 'server' are now empty on both local and remote.
-pause
-exit /b
-
 :empty_branch
 set "BRANCH=%~1"
 echo.
-echo ----- Processing branch: %BRANCH% -----
+echo ========================================
+echo Processing branch: %BRANCH%
+echo ========================================
 
-:: Delete local branch if it exists
-git branch -D %BRANCH% 2>nul
-
-:: Remove any worktree files from a previous checkout (safety)
-git reset --hard HEAD 2>nul
-
-:: Create a brand new orphan branch (no history)
-git checkout --orphan %BRANCH%
+:: 1. Try to checkout the branch from remote, or create orphan if missing
+echo [1/5] Switching to branch %BRANCH% ...
+git checkout %BRANCH% 2>nul
 if errorlevel 1 (
-    echo Failed to create orphan branch %BRANCH%. Skipping.
-    exit /b
+    echo Branch does not exist locally or remote. Creating orphan...
+    git checkout --orphan %BRANCH%
+) else (
+    echo Already on branch %BRANCH%.
+    :: If we got here, we might have files. We'll delete them next.
 )
 
-:: Delete ALL files and folders (except .git) from the working tree
-echo Removing all files and folders...
+:: 2. Safety check – are we REALLY on the target branch?
+for /f "tokens=*" %%a in ('git rev-parse --abbrev-ref HEAD') do set "CURRENT_BRANCH=%%a"
+if /i not "%CURRENT_BRANCH%"=="%BRANCH%" (
+    echo ERROR: Could not switch to %BRANCH%. Aborting.
+    goto :eof
+)
+
+:: 3. Delete ALL files and folders (except .git)
+echo [2/5] Deleting all files and folders on %BRANCH% ...
 for /d %%i in (*) do (
     if /i not "%%i"==".git" (
         rmdir /s /q "%%i" 2>nul
@@ -61,7 +58,7 @@ for %%f in (*) do (
     del /f /q "%%f" 2>nul
 )
 
-:: Also remove hidden files/folders (like .gitignore) – but NOT .git
+:: Also handle hidden items (except .git)
 for /d %%i in (.*) do (
     set "dirname=%%i"
     if /i not "!dirname!"==".git" (
@@ -74,18 +71,32 @@ for %%f in (.*) do (
     )
 )
 
-:: Commit the empty branch (allow empty commit)
-echo Committing empty branch...
+:: 4. Commit the empty state (allow empty commit)
+echo [3/5] Committing empty state ...
 git add -A
 git commit --allow-empty -m "Empty branch (reset)"
 
-:: Force push to GitHub (overwrite remote completely)
-echo Pushing empty branch to origin...
-git push --force origin %BRANCH%
+:: 5. Force push to overwrite remote history completely
+echo [4/5] Force pushing to origin/%BRANCH% ...
+git push --force --set-upstream origin %BRANCH%
 
-:: Clean up local orphan branch (switch back later)
+:: 6. Detach HEAD and delete the local orphan (cleanup)
+echo [5/5] Cleaning up local temporary branch ...
 git checkout --detach
-git branch -D %BRANCH%
+git branch -D %BRANCH% 2>nul
 
-echo Branch '%BRANCH%' has been emptied and pushed.
 goto :eof
+
+:: Now call the function for both branches
+call :empty_branch client
+call :empty_branch server
+
+:: Return to original branch
+echo.
+echo Returning to original branch: %ORIG_BRANCH%
+git checkout %ORIG_BRANCH%
+
+echo.
+echo Done! 'client' and 'server' are now empty on both local and remote.
+echo All history has been removed.
+pause
