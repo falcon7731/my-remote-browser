@@ -330,11 +330,11 @@ class GitRepo:
         self.repo.git.checkout(original_branch)
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-        def pull_session_files(self, session_dir, branch="Seasions"):
-            """
-            Pull the browser session files from the isolated branch.
-            If the branch doesn't exist yet, do nothing.
-            """
+    def pull_session_files(self, session_dir, branch="Seasions"):
+        """
+        Pull the browser session files from the isolated branch.
+        If the branch doesn't exist yet, do nothing.
+        """
         log(f"[Git] Pulling session files from '{branch}'...")
         try:
             # Use the low‑level git command to avoid Remote.fetch API confusion
