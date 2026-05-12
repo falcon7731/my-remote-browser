@@ -34,7 +34,7 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install --upgrade -r requirements.txt
           fi
-          pip install --upgrade gitpython playwright requests
+          pip install --upgrade gitpython playwright requests playwright-stealth
           playwright install --with-deps chromium
 
       # ----- Start Cloudflare WARP proxy container -----

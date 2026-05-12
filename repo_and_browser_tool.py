@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
 Remote‑driven automation orchestrator with WARP proxy, session persistence,
-shutdown helper, cursor helpers, shallow updates, and automatic commit.
-
+advanced stealth, shutdown helper, cursor helpers, shallow updates, and automatic commit.
 Browser profile is kept outside the repo.
-After manual stop or shutdown, client & server branches are cleared.
 """
 
-import os, sys, time, traceback, threading, argparse, shutil, re
+import os, sys, time, traceback, threading, argparse, shutil, re, random
 from git import Repo, GitCommandError
 
 # ---------- Playwright import ----------
@@ -16,6 +14,13 @@ try:
     HAS_PLAYWRIGHT = True
 except ImportError:
     HAS_PLAYWRIGHT = False
+
+# ---------- Stealth import (optional) ----------
+try:
+    from playwright_stealth import stealth_sync
+    HAS_STEALTH = True
+except ImportError:
+    HAS_STEALTH = False
 
 # ==================== CONSOLE LOGGING ====================
 def log(msg: str):
@@ -27,9 +32,7 @@ def global_exception_handler(exc_type, exc_value, exc_tb):
 
 sys.excepthook = global_exception_handler
 
-# Custom exception for clean shutdown
 class ShutdownException(Exception):
-    """Raised by the shutdown() helper to exit the loop gracefully."""
     pass
 
 # ==================== TASK SCHEDULER ====================
@@ -66,7 +69,7 @@ class StealthBrowser:
             user_data_dir = os.path.join(os.getcwd(), '..', 'browser_profile')
         self.user_data_dir = user_data_dir
         self.headless = headless
-        self.proxy = proxy          # e.g. 'socks5://127.0.0.1:1080'
+        self.proxy = proxy
         self._pw = None
         self._context = None
 
@@ -76,19 +79,32 @@ class StealthBrowser:
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-component-extensions-with-background-pages",
+            "--disable-default-apps",
+            "--disable-extensions",
+            "--disable-features=TranslateUI,BlinkGenPropertyTrees",
+            "--hide-scrollbars",
+            "--mute-audio",
+            "--no-first-run",
+            "--disable-infobars",
+            "--disable-dev-shm-usage",
         ]
         if self.proxy:
             launch_args.append(f"--proxy-server={self.proxy}")
             log(f"[Browser] Using proxy: {self.proxy}")
 
+        # Randomize viewport slightly to avoid fingerprint uniformity
+        w, h = random.randint(1250, 1350), random.randint(650, 750)
         self._context = self._pw.chromium.launch_persistent_context(
             user_data_dir=self.user_data_dir,
             headless=self.headless,
             args=launch_args,
-            slow_mo=100,
-            viewport={"width": 1280, "height": 720},
+            slow_mo=random.randint(20, 100),
+            viewport={"width": w, "height": h},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         )
-        log("[Browser] Started.")
+        log(f"[Browser] Started (viewport {w}x{h}).")
 
     def stop(self):
         if self._context:
@@ -100,7 +116,15 @@ class StealthBrowser:
     def new_page(self):
         if not self._context:
             raise RuntimeError("Browser not started.")
-        return self._context.new_page()
+        page = self._context.new_page()
+        # Apply stealth patch if available
+        if HAS_STEALTH:
+            try:
+                stealth_sync(page)
+                log("[Browser] Stealth patch applied to new page.")
+            except Exception as e:
+                log(f"[Browser] Stealth patch failed: {e}")
+        return page
 
     def goto(self, page, url, wait_until="domcontentloaded"):
         log(f"[Browser] Navigating to {url}...")
@@ -196,7 +220,6 @@ class GitRepo:
             raise
 
     def shallow_pull(self, branch="main"):
-        """Force local branch to exactly match remote (shallow)."""
         try:
             self.repo.git.fetch("--depth", "1", "origin", branch)
             self.repo.git.reset("--hard", f"origin/{branch}")
@@ -260,7 +283,6 @@ class GitRepo:
         log("[Git] add + commit + force push done.")
 
     def clear_branch_files(self, branch_name, commit_message="Clear branch files"):
-        """Delete all files on the branch and commit the deletion. History remains."""
         log(f"[Git] Clearing files on branch '{branch_name}'...")
         try:
             self.repo.git.checkout(branch_name)
@@ -283,11 +305,8 @@ class GitRepo:
         self.origin.push()
         log(f"[Git] Pushed cleared branch '{branch_name}'.")
 
-    # ---------- Session persistence (Seasions branch) ----------
+    # ---------- Session persistence ----------
     def push_session_files(self, session_dir, branch="Seasions"):
-        """
-        Push ONLY the browser session files to an isolated branch.
-        """
         log(f"[Git] Pushing session files to '{branch}'...")
         original_branch = self.repo.active_branch.name
         tmp_dir = "/tmp/seasions_upload"
@@ -295,7 +314,6 @@ class GitRepo:
             shutil.rmtree(tmp_dir)
         shutil.copytree(session_dir, tmp_dir, dirs_exist_ok=True)
 
-        # Switch to or create Seasions branch
         try:
             self.repo.git.checkout(branch)
         except GitCommandError:
@@ -303,62 +321,43 @@ class GitRepo:
             self.repo.git.rm('-rf', '--cached', '.')
             self.repo.git.commit('--allow-empty', '-m', 'Init Seasions')
 
-        # Clear existing contents
         for item in os.listdir('.'):
             if item != '.git':
                 p = os.path.join('.', item)
-                if os.path.isfile(p) or os.path.islink(p):
-                    os.remove(p)
-                elif os.path.isdir(p):
-                    shutil.rmtree(p)
+                if os.path.isfile(p) or os.path.islink(p): os.remove(p)
+                elif os.path.isdir(p): shutil.rmtree(p)
 
-        # Copy session files into working tree
         for item in os.listdir(tmp_dir):
             src = os.path.join(tmp_dir, item)
             dst = os.path.join('.', item)
-            if os.path.isfile(src):
-                shutil.copy2(src, dst)
-            elif os.path.isdir(src):
-                shutil.copytree(src, dst)
+            if os.path.isfile(src): shutil.copy2(src, dst)
+            elif os.path.isdir(src): shutil.copytree(src, dst)
 
         self.add_all()
         self.commit("Save browser session")
         self.origin.push(force=True)
         log(f"[Git] Session files pushed to '{branch}'")
 
-        # Return to original branch
         self.repo.git.checkout(original_branch)
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def pull_session_files(self, session_dir, branch="Seasions"):
-        """
-        Pull the browser session files from the isolated branch.
-        If the branch doesn't exist yet, do nothing.
-        """
         log(f"[Git] Pulling session files from '{branch}'...")
         try:
-            # Use the low‑level git command to avoid Remote.fetch API confusion
             self.repo.git.fetch("--depth", "1", "origin", branch)
-            # Checkout the remote branch content into the working tree
             self.repo.git.checkout(f"origin/{branch}", "--", ".")
         except GitCommandError:
             log(f"[Git] No remote '{branch}' branch yet.")
             return
 
-        # Copy everything from working tree (now session files) to session_dir
         os.makedirs(session_dir, exist_ok=True)
         for item in os.listdir('.'):
-            if item == '.git' or item == 'browser_profile':
-                continue
+            if item == '.git' or item == 'browser_profile': continue
             src = os.path.join('.', item)
             dst = os.path.join(session_dir, item)
-            if os.path.isfile(src):
-                shutil.copy2(src, dst)
-            elif os.path.isdir(src):
-                shutil.copytree(src, dst)
+            if os.path.isfile(src): shutil.copy2(src, dst)
+            elif os.path.isdir(src): shutil.copytree(src, dst)
         log("[Git] Session files restored to browser profile.")
-
-        # Reset working tree to a clean state (undo the checkout)
         self.repo.git.checkout('--', '.')
 
 
@@ -371,7 +370,6 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
     log("=== Starting infinity task loop ===")
     executed = {'task', 'repo_and_browser_tool'}
 
-    # ---------- Build helper functions ----------
     cursor_helpers = {}
     if page is not None:
         def _move_mouse(x, y): page.mouse.move(x, y)
@@ -492,13 +490,12 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
                 f.write(html_content)
             log(f"Complete page saved to folder {folder_path}")
 
-        # ---- shutdown helper ----
+        # ---- shutdown ----
         def _shutdown():
             log("Shutdown requested – saving session and exiting loop.")
             git_repo.push_session_files(browser.user_data_dir, "Seasions")
             raise ShutdownException("Manual shutdown")
 
-        # Assemble all helpers
         cursor_helpers = {
             'move_mouse': _move_mouse,
             'get_cursor_position': _get_cursor_position,
@@ -556,7 +553,7 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
                 log(f"{script_name} failed: {e}")
                 traceback.print_exc()
 
-            # Auto‑commit whatever the script created
+            # Auto‑commit
             git_repo.add_all()
             git_repo.commit(f"Auto-commit after {script_name}")
             git_repo.push(force=True)
@@ -566,11 +563,12 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
             log(f"Marked {script_name} as executed. Total: {len(executed)}")
 
         except ShutdownException:
-            raise   # let it propagate to main()
+            raise
         except Exception as e:
             log(f"Loop error: {e}")
             traceback.print_exc()
             time.sleep(5)
+
 
 # ==================== MAIN ====================
 def main():
@@ -578,7 +576,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--browser", action="store_true")
     parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--proxy", default="socks5://127.0.0.1:1080", help="SOCKS5 proxy for the browser (default: WARP)")
+    parser.add_argument("--proxy", default="socks5://127.0.0.1:1080")
     args = parser.parse_args()
 
     os.system('git config user.name "github-actions[bot]"')
@@ -594,19 +592,16 @@ def main():
         log("Pulling latest main...")
         git_repo.pull()
 
-        # ---- Pull saved browser session before starting ----
         session_dir = os.path.join(os.getcwd(), '..', 'browser_profile')
         git_repo.pull_session_files(session_dir, "Seasions")
 
-        # ---- Clean client and server branches at startup ----
-        log("Cleaning client and server branches at startup...")
+        log("Cleaning client and server branches...")
         git_repo.clear_branch_files('client')
         git_repo.clear_branch_files('server')
 
         if args.browser:
             if not HAS_PLAYWRIGHT:
-                log("Playwright missing.")
-                sys.exit(1)
+                log("Playwright missing."); sys.exit(1)
             browser = StealthBrowser(headless=args.headless, proxy=args.proxy)
             browser.start()
             page = browser.new_page()
