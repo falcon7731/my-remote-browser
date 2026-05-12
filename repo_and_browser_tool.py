@@ -306,8 +306,9 @@ class GitRepo:
     # ---------- Session persistence ----------
     def push_session_files(self, session_dir, branch="Seasions"):
         """
-        Push ONLY the browser session files to the 'Seasions' branch.
-        Creates a fresh orphan commit every time to ensure complete isolation.
+        Push ONLY the browser session files to an isolated branch.
+        Creates a temporary orphan, copies files, force‑pushes.
+        Always cleans up and returns to the original branch.
         """
         log(f"[Git] Pushing session files to '{branch}'...")
         original_branch = self.repo.active_branch.name
@@ -316,46 +317,44 @@ class GitRepo:
             shutil.rmtree(tmp_dir)
         shutil.copytree(session_dir, tmp_dir, dirs_exist_ok=True)
 
-        # Create a clean orphan branch from nothing
         try:
+            # 1. Delete any leftover temp branch
+            self.repo.git.branch('-D', '_temp_seasions', ignore_error=True)
+
+            # 2. Create a fresh orphan
             self.repo.git.checkout('--orphan', '_temp_seasions')
-        except:
-            # If _temp_seasions exists, delete and recreate
-            self.repo.git.branch('-D', '_temp_seasions')
-            self.repo.git.checkout('--orphan', '_temp_seasions')
 
-        # Remove everything from index and working tree
-        self.repo.git.rm('-rf', '--cached', '.')
-        for item in os.listdir('.'):
-            if item != '.git':
-                p = os.path.join('.', item)
-                if os.path.isfile(p) or os.path.islink(p):
-                    os.remove(p)
-                elif os.path.isdir(p):
-                    shutil.rmtree(p)
+            # 3. Remove everything safely (only if something is tracked)
+            try:
+                self.repo.git.rm('-rf', '--cached', '.')
+            except GitCommandError:
+                pass   # nothing tracked – fine
+            # Clean untracked files
+            try:
+                self.repo.git.clean('-fd')
+            except GitCommandError:
+                pass
 
-        # Commit empty
-        self.repo.git.commit('--allow-empty', '-m', 'Empty base')
+            # 4. Copy session files into the working tree
+            for item in os.listdir(tmp_dir):
+                src = os.path.join(tmp_dir, item)
+                dst = os.path.join('.', item)
+                if os.path.isfile(src):
+                    shutil.copy2(src, dst)
+                elif os.path.isdir(src):
+                    shutil.copytree(src, dst)
 
-        # Copy session files into the empty tree
-        for item in os.listdir(tmp_dir):
-            src = os.path.join(tmp_dir, item)
-            dst = os.path.join('.', item)
-            if os.path.isfile(src):
-                shutil.copy2(src, dst)
-            elif os.path.isdir(src):
-                shutil.copytree(src, dst)
+            # 5. Stage, commit, force‑push
+            self.repo.git.add(A=True)
+            self.repo.index.commit("Save browser session")
+            self.repo.git.push('--force', '--set-upstream', 'origin', f'_temp_seasions:{branch}')
+            log(f"[Git] Session files pushed to '{branch}'")
 
-        self.add_all()
-        self.commit("Save browser session")
-        # Force push to overwrite remote Seasions with this isolated commit
-        self.repo.git.push('--force', '--set-upstream', 'origin', f'_temp_seasions:{branch}')
-        log(f"[Git] Session files pushed to '{branch}' (isolated commit).")
-
-        # Cleanup: switch back to original branch and delete temp branch
-        self.repo.git.checkout(original_branch)
-        self.repo.git.branch('-D', '_temp_seasions')
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        finally:
+            # Always go back to the original branch and delete the temp branch
+            self.repo.git.checkout(original_branch)
+            self.repo.git.branch('-D', '_temp_seasions', ignore_error=True)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def pull_session_files(self, session_dir, branch="Seasions"):
         log(f"[Git] Pulling session files from '{branch}'...")
@@ -534,7 +533,10 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
         # ---- shutdown ----
         def _shutdown():
             log("Shutdown requested – saving session and exiting loop.")
-            git_repo.push_session_files(browser.user_data_dir, "Seasions")
+            try:
+                git_repo.push_session_files(browser.user_data_dir, "Seasions")
+            except Exception as e:
+                log(f"[WARNING] Session save failed: {e}")
             raise ShutdownException("Manual shutdown")
 
         # ---- Combine all helpers ----
