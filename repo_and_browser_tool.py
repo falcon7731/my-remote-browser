@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 Remote‑driven automation orchestrator with WARP proxy, session persistence,
-advanced stealth, shutdown helper, cursor helpers, shallow updates, and automatic commit.
+advanced stealth, shutdown helper, cursor helpers, download capture, and automatic commit.
 Browser profile is kept outside the repo.
 """
 
-import os, sys, time, traceback, threading, argparse, shutil, re, random
+import os, sys, time, traceback, threading, argparse, shutil, re, random, json
 from git import Repo, GitCommandError
 
 # ---------- Playwright import ----------
@@ -94,7 +94,6 @@ class StealthBrowser:
             launch_args.append(f"--proxy-server={self.proxy}")
             log(f"[Browser] Using proxy: {self.proxy}")
 
-        # Randomize viewport slightly to avoid fingerprint uniformity
         w, h = random.randint(1250, 1350), random.randint(650, 750)
         self._context = self._pw.chromium.launch_persistent_context(
             user_data_dir=self.user_data_dir,
@@ -117,7 +116,6 @@ class StealthBrowser:
         if not self._context:
             raise RuntimeError("Browser not started.")
         page = self._context.new_page()
-        # Apply stealth patch if available
         if HAS_STEALTH:
             try:
                 stealth_sync(page)
@@ -370,6 +368,31 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
     log("=== Starting infinity task loop ===")
     executed = {'task', 'repo_and_browser_tool'}
 
+    # ------- Download capture -------
+    downloads = []
+
+    def on_download(download):
+        try:
+            info = {
+                "url": download.url,
+                "filename": download.suggested_filename,
+                "page_url": download.page.url,
+                "size": None
+            }
+            log(f"[Download] Captured: {info['filename']} from {info['url']}")
+            downloads.append(info)
+            download.cancel()
+        except Exception as e:
+            log(f"[Download] Error capturing download: {e}")
+
+    page.on("download", on_download)
+
+    def save_download_info(filepath):
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(downloads, f, indent=2)
+        log(f"Download info saved to {filepath}")
+
+    # ------- Regular helpers -------
     cursor_helpers = {}
     if page is not None:
         def _move_mouse(x, y): page.mouse.move(x, y)
@@ -496,6 +519,7 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
             git_repo.push_session_files(browser.user_data_dir, "Seasions")
             raise ShutdownException("Manual shutdown")
 
+        # ---- Combine all helpers ----
         cursor_helpers = {
             'move_mouse': _move_mouse,
             'get_cursor_position': _get_cursor_position,
@@ -507,6 +531,8 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
             'save_page_as_mhtml': _save_page_as_mhtml,
             'save_page_as_folder': _save_page_as_folder,
             'shutdown': _shutdown,
+            'downloads': downloads,
+            'save_download_info': save_download_info,
         }
 
     # ---------- Main loop ----------
@@ -549,6 +575,8 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
             try:
                 exec(compile(code, script_name, 'exec'), task_globals)
                 log(f"{script_name} completed successfully.")
+            except ShutdownException:
+                raise                 # <-- let it propagate properly
             except Exception as e:
                 log(f"{script_name} failed: {e}")
                 traceback.print_exc()
