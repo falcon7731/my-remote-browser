@@ -47,8 +47,9 @@ save_page_as_mhtml(page, f"{sequence_number}page_single3.mhtml")
 
 
 
-shutdown()
+
 '''
+shutdown()
 show_cursor()
 move_mouse(957, 621)
 page.mouse.click(957, 621)
