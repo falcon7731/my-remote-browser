@@ -1,0 +1,42 @@
+name: Delete Branches
+
+on:
+  workflow_dispatch:
+    inputs:
+      branches:
+        description: 'Branch(es) to delete (space‑separated, e.g. client server)'
+        required: true
+        default: 'client server'
+
+permissions:
+  contents: write
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (shallow)
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      - name: Setup Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Delete branches
+        env:
+          BRANCHES: ${{ github.event.inputs.branches }}
+        run: |
+          echo "Branches to delete: $BRANCHES"
+          for branch in $BRANCHES; do
+            if [ -z "$branch" ]; then continue; fi
+            echo "Attempting to delete $branch..."
+            # Delete remote branch
+            git push origin --delete "$branch" || echo "  Failed to delete remote $branch (maybe it doesn't exist)"
+            # Delete local tracking branch (if present)
+            git branch -D "$branch" 2>/dev/null || echo "  No local branch $branch to delete"
+          done
+          echo "Done."
