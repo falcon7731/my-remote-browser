@@ -1,0 +1,13 @@
+log('Executing recorded actions')
+viewport_h = page.evaluate('window.innerHeight')
+log('Full-page click: target=(1084,259), viewport_h=' + str(viewport_h))
+scroll_y = max(0, 259 - viewport_h // 2)
+click_y = 259 - scroll_y
+log(f'Scrolling to scroll_y={scroll_y}, click_y={click_y}')
+page.evaluate(f'window.scrollTo(0, {scroll_y})')
+wait_timeout(page, 0.3)
+move_mouse(1084, click_y)
+page.mouse.click(1084, click_y)
+wait_timeout(page, 0.3)
+browser.screenshot(page, 'latest_screenshot.png', full_page=True)
+with open('done_1778692141_a88b.txt','w') as f: f.write('ok')
