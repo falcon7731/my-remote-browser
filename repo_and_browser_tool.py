@@ -3,9 +3,10 @@
 Remote‑driven automation orchestrator with WARP proxy, session persistence,
 advanced stealth, shutdown helper, cursor helpers, download capture, and automatic commit.
 Browser profile is kept outside the repo.
+All Git network operations have a 30‑second timeout to prevent hangs.
 """
 
-import os, sys, time, traceback, threading, argparse, shutil, re, random, json
+import os, sys, time, traceback, threading, argparse, shutil, re, random, json, subprocess
 from git import Repo, GitCommandError
 
 # ---------- Playwright import ----------
@@ -195,7 +196,7 @@ def wait_timeout(page, seconds):
     log("[Page] Fixed wait done.")
 
 
-# ==================== GIT OPERATIONS ====================
+# ==================== GIT OPERATIONS (with timeout) ====================
 class GitRepo:
     def __init__(self, repo_path="."):
         log(f"[Git] Initialising repo at {repo_path}")
@@ -203,12 +204,32 @@ class GitRepo:
         if self.repo.bare:
             raise ValueError("Bare repo not supported.")
         self.origin = self.repo.remote("origin")
+        self.working_dir = self.repo.working_dir
+
+    def _run_git(self, *args, timeout=30):
+        """Run a git command with a timeout and log output. Raises GitCommandError on failure."""
+        cmd = ['git'] + list(args)
+        log(f"[Git] Running: {' '.join(cmd)}")
+        try:
+            result = subprocess.run(cmd, cwd=self.working_dir,
+                                    capture_output=True, text=True, timeout=timeout)
+            if result.returncode != 0:
+                log(f"[Git] Error: {result.stderr.strip()}")
+                raise GitCommandError(args, result.returncode, stderr=result.stderr)
+            return result.stdout
+        except subprocess.TimeoutExpired:
+            log(f"[Git] Timeout after {timeout}s: {' '.join(cmd)}")
+            raise GitCommandError(args, 1, stderr='timeout')
 
     def pull(self, rebase=False):
         log("[Git] Pulling...")
         try:
             before = self.repo.head.commit.hexsha
-            self.origin.pull(rebase=rebase)
+            # Use subprocess git pull with timeout
+            args = ['pull', '--depth', '1']
+            if rebase:
+                args.append('--rebase')
+            self._run_git(*args)
             after = self.repo.head.commit.hexsha
             changed = before != after
             log(f"[Git] Pull {'brought new commits' if changed else 'up to date'}.")
@@ -218,15 +239,20 @@ class GitRepo:
             raise
 
     def shallow_pull(self, branch="main"):
+        """Fetch and reset a branch (shallow) with timeout."""
         try:
-            self.repo.git.fetch("--depth", "1", "origin", branch)
-            self.repo.git.reset("--hard", f"origin/{branch}")
+            self._run_git('fetch', '--depth', '1', 'origin', branch)
+            self.repo.git.reset('--hard', f'origin/{branch}')
             log(f"[Git] Force reset to origin/{branch} (shallow).")
         except GitCommandError as e:
             log(f"[Git] Shallow reset failed for '{branch}': {e}")
 
     def check_branch_update(self, branch="main"):
-        self.origin.fetch()
+        """Fetch (shallow) and compare remote vs local."""
+        try:
+            self._run_git('fetch', '--depth', '1', 'origin', branch)
+        except GitCommandError:
+            return []
         try:
             local_commit = self.repo.head.commit
             remote_commit = self.repo.refs[f"origin/{branch}"].commit
@@ -268,10 +294,10 @@ class GitRepo:
 
     def push(self, force=False):
         if force:
-            self.origin.push(force=True)
+            self.repo.git.push('--force', 'origin', self.repo.active_branch.name)
             log("[Git] Force pushed.")
         else:
-            self.origin.push()
+            self.repo.git.push('origin', self.repo.active_branch.name)
             log("[Git] Pushed.")
 
     def add_commit_force_push(self, message="Automated force push"):
@@ -300,16 +326,11 @@ class GitRepo:
             log(f"[Git] Committed file deletions on '{branch_name}'.")
         else:
             log(f"[Git] No files to delete on '{branch_name}'.")
-        self.origin.push()
+        self.repo.git.push('origin', branch_name)
         log(f"[Git] Pushed cleared branch '{branch_name}'.")
 
-    # ---------- Session persistence ----------
+    # ---------- Session persistence (unchanged, they already use gitpython, but we'll keep them as they are) ----------
     def push_session_files(self, session_dir, branch="Seasion"):
-        """
-        Push ONLY the browser session files to an isolated branch.
-        Creates a temporary orphan, copies files, force‑pushes.
-        Always cleans up and returns to the original branch.
-        """
         log(f"[Git] Pushing session files to '{branch}'...")
         original_branch = self.repo.active_branch.name
         tmp_dir = "/tmp/Seasion_upload"
@@ -318,27 +339,22 @@ class GitRepo:
         shutil.copytree(session_dir, tmp_dir, dirs_exist_ok=True)
 
         try:
-            # 1. Safely remove any leftover temp branch
             try:
                 self.repo.git.branch('-D', '_temp_Seasion')
             except GitCommandError:
-                pass   # branch didn't exist – that's fine
+                pass
 
-            # 2. Create a fresh orphan
             self.repo.git.checkout('--orphan', '_temp_Seasion')
 
-            # 3. Remove everything already tracked (if any)
             try:
                 self.repo.git.rm('-rf', '--cached', '.')
             except GitCommandError:
                 pass
-            # Also delete untracked files
             try:
                 self.repo.git.clean('-fd')
             except GitCommandError:
                 pass
 
-            # 4. Copy session files into the working tree
             for item in os.listdir(tmp_dir):
                 src = os.path.join(tmp_dir, item)
                 dst = os.path.join('.', item)
@@ -347,14 +363,11 @@ class GitRepo:
                 elif os.path.isdir(src):
                     shutil.copytree(src, dst)
 
-            # 5. Stage, commit, force‑push
             self.repo.git.add(A=True)
             self.repo.index.commit("Save browser session")
             self.repo.git.push('--force', '--set-upstream', 'origin', f'_temp_Seasion:{branch}')
             log(f"[Git] Session files pushed to '{branch}'")
-
         finally:
-            # Always go back to the original branch and delete the temp branch
             self.repo.git.checkout(original_branch)
             try:
                 self.repo.git.branch('-D', '_temp_Seasion')
@@ -365,7 +378,7 @@ class GitRepo:
     def pull_session_files(self, session_dir, branch="Seasion"):
         log(f"[Git] Pulling session files from '{branch}'...")
         try:
-            self.repo.git.fetch("--depth", "1", "origin", branch)
+            self._run_git('fetch', '--depth', '1', 'origin', branch)
             self.repo.git.checkout(f"origin/{branch}", "--", ".")
         except GitCommandError:
             log(f"[Git] No remote '{branch}' branch yet.")
@@ -380,7 +393,6 @@ class GitRepo:
             elif os.path.isdir(src): shutil.copytree(src, dst)
         log("[Git] Session files restored to browser profile.")
 
-        # Hard reset to remove any leftover modifications from the session checkout
         self.repo.git.reset('--hard', 'HEAD')
         self.repo.git.clean('-fd')
 
@@ -565,76 +577,76 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
         }
 
     # ---------- Main loop ----------
-        while True:
+    while True:
+        try:
+            # Force clean working tree to avoid "overwritten by checkout" errors
             try:
-                # Force clean working tree to avoid "overwritten by checkout" errors
-                try:
-                    git_repo.repo.git.reset('--hard', 'HEAD')
-                    git_repo.repo.git.clean('-fd')
-                except:
-                    pass
+                git_repo.repo.git.reset('--hard', 'HEAD')
+                git_repo.repo.git.clean('-fd')
+            except:
+                pass
 
-                git_repo.repo.git.checkout('client')
-                git_repo.shallow_pull('client')
+            git_repo.repo.git.checkout('client')
+            git_repo.shallow_pull('client')
 
-                all_py = [f for f in os.listdir('.') if f.endswith('.py') and f != '__init__.py']
-                unexecuted = [f for f in all_py if os.path.splitext(f)[0] not in executed]
+            all_py = [f for f in os.listdir('.') if f.endswith('.py') and f != '__init__.py']
+            unexecuted = [f for f in all_py if os.path.splitext(f)[0] not in executed]
 
-                if not unexecuted:
-                    log("No new scripts. Waiting 3 seconds...")
-                    time.sleep(3)
-                    continue
+            if not unexecuted:
+                log("No new scripts. Waiting 3 seconds...")
+                time.sleep(3)
+                continue
 
-                unexecuted.sort(key=natural_sort_key)
-                script_name = unexecuted[0]
-                script_stem = os.path.splitext(script_name)[0]
-                log(f"Next script: {script_name} (sequence {script_stem})")
+            unexecuted.sort(key=natural_sort_key)
+            script_name = unexecuted[0]
+            script_stem = os.path.splitext(script_name)[0]
+            log(f"Next script: {script_name} (sequence {script_stem})")
 
-                with open(script_name, 'r', encoding='utf-8') as f:
-                    code = f.read()
+            with open(script_name, 'r', encoding='utf-8') as f:
+                code = f.read()
 
-                git_repo.repo.git.checkout('server')
-                git_repo.shallow_pull('server')
+            git_repo.repo.git.checkout('server')
+            git_repo.shallow_pull('server')
 
-                task_globals = {
-                    'browser': browser, 'page': page, 'git_repo': git_repo,
-                    'scheduler': scheduler, 'log': log,
-                    'wait_for_page_loaded': wait_for_page_loaded,
-                    'wait_for_element': wait_for_element,
-                    'wait_timeout': wait_timeout,
-                    'time': time, 'os': os, 'sys': sys,
-                    'sequence_number': script_stem,
-                }
-                task_globals.update(cursor_helpers)
+            task_globals = {
+                'browser': browser, 'page': page, 'git_repo': git_repo,
+                'scheduler': scheduler, 'log': log,
+                'wait_for_page_loaded': wait_for_page_loaded,
+                'wait_for_element': wait_for_element,
+                'wait_timeout': wait_timeout,
+                'time': time, 'os': os, 'sys': sys,
+                'sequence_number': script_stem,
+            }
+            task_globals.update(cursor_helpers)
 
-                log(f"--- Executing {script_name} ---")
-                try:
-                    exec(compile(code, script_name, 'exec'), task_globals)
-                    log(f"{script_name} completed successfully.")
-                except ShutdownException:
-                    git_repo.add_all()
-                    git_repo.commit(f"Auto-commit after {script_name} (shutdown)")
-                    git_repo.push(force=True)
-                    log("Pushed changes to server branch before shutdown.")
-                    raise
-                except Exception as e:
-                    log(f"{script_name} failed: {e}")
-                    traceback.print_exc()
-                else:
-                    git_repo.add_all()
-                    git_repo.commit(f"Auto-commit after {script_name}")
-                    git_repo.push(force=True)
-                    log("Pushed changes to server branch.")
-
-                executed.add(script_stem)
-                log(f"Marked {script_name} as executed. Total: {len(executed)}")
-
+            log(f"--- Executing {script_name} ---")
+            try:
+                exec(compile(code, script_name, 'exec'), task_globals)
+                log(f"{script_name} completed successfully.")
             except ShutdownException:
+                git_repo.add_all()
+                git_repo.commit(f"Auto-commit after {script_name} (shutdown)")
+                git_repo.push(force=True)
+                log("Pushed changes to server branch before shutdown.")
                 raise
             except Exception as e:
-                log(f"Loop error: {e}")
+                log(f"{script_name} failed: {e}")
                 traceback.print_exc()
-                time.sleep(5)
+            else:
+                git_repo.add_all()
+                git_repo.commit(f"Auto-commit after {script_name}")
+                git_repo.push(force=True)
+                log("Pushed changes to server branch.")
+
+            executed.add(script_stem)
+            log(f"Marked {script_name} as executed. Total: {len(executed)}")
+
+        except ShutdownException:
+            raise
+        except Exception as e:
+            log(f"Loop error: {e}")
+            traceback.print_exc()
+            time.sleep(5)
 
 
 # ==================== MAIN ====================
@@ -685,7 +697,6 @@ def main():
         log(f"Fatal error in main: {e}")
         traceback.print_exc()
     finally:
-        # No longer clearing client/server branches – they are cleaned at startup only.
         if browser:
             try: browser.stop()
             except: pass
