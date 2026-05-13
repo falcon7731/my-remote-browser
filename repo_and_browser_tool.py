@@ -4,6 +4,7 @@ Remote‑driven automation orchestrator with WARP proxy, session persistence,
 advanced stealth, shutdown helper, cursor helpers, download capture, and automatic commit.
 All Git network operations have a 30‑second timeout to prevent hangs.
 Ctrl+C shuts down the loop immediately.
+Downloads are captured even when triggered by direct navigation.
 """
 
 import os, sys, time, traceback, threading, argparse, shutil, re, random, json, subprocess, signal
@@ -440,6 +441,26 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
             json.dump(downloads, f, indent=2)
         log(f"Download info saved to {filepath}")
 
+    # ---------- OVERRIDE browser.goto to catch direct‑download errors ----------
+    original_goto = browser.goto
+    def safe_goto(page, url, wait_until="domcontentloaded"):
+        try:
+            original_goto(page, url, wait_until)
+        except Exception as e:
+            err_msg = str(e)
+            if 'Download is starting' in err_msg:
+                log(f"[Browser] Direct download detected: {url}")
+                downloads.append({
+                    "url": url,
+                    "filename": "",
+                    "page_url": page.url,
+                    "size": None
+                })
+                save_download_info('downloads.json')
+            # Re‑raise the error so the task knows navigation failed
+            raise
+    browser.goto = safe_goto   # replace the method for all tasks
+
     # ------- Regular helpers -------
     cursor_helpers = {}
     if page is not None:
@@ -634,6 +655,8 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
                 exec(compile(code, script_name, 'exec'), task_globals)
                 log(f"{script_name} completed successfully.")
             except ShutdownException:
+                # Save download info before shutting down
+                save_download_info('downloads.json')
                 git_repo.add_all()
                 git_repo.commit(f"Auto-commit after {script_name} (shutdown)")
                 git_repo.push(force=True)
@@ -642,11 +665,15 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
             except Exception as e:
                 log(f"{script_name} failed: {e}")
                 traceback.print_exc()
-            else:
-                git_repo.add_all()
-                git_repo.commit(f"Auto-commit after {script_name}")
-                git_repo.push(force=True)
-                log("Pushed changes to server branch.")
+            finally:
+                # Always save the current download list to disk
+                save_download_info('downloads.json')
+
+            # Auto‑commit whatever the script created
+            git_repo.add_all()
+            git_repo.commit(f"Auto-commit after {script_name}")
+            git_repo.push(force=True)
+            log("Pushed changes to server branch.")
 
             executed.add(script_stem)
             log(f"Marked {script_name} as executed. Total: {len(executed)}")
