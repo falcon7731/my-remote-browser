@@ -1,0 +1,8 @@
+log('Executing recorded actions')
+log('Click at (1094,262)')
+move_mouse(1094, 262)
+page.mouse.click(1094, 262)
+wait_timeout(page, 0.3)
+log('Waiting 5.0 seconds after actions')
+wait_timeout(page, 5.0)
+browser.screenshot(page, 'latest_screenshot.png', full_page=False)
