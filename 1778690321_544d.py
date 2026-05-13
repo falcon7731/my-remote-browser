@@ -1,6 +1,0 @@
-log('Executing recorded actions')
-log('Click at (1081,265)')
-move_mouse(1081, 265)
-page.mouse.click(1081, 265)
-wait_timeout(page, 0.3)
-browser.screenshot(page, 'latest_screenshot.png', full_page=False)

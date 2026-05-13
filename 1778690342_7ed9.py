@@ -1,1 +1,0 @@
-browser.screenshot(page, 'latest_screenshot.png', full_page=False)

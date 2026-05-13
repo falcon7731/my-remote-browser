@@ -1,7 +1,0 @@
-log('Executing recorded actions')
-log('Click at (891,508)')
-move_mouse(891, 508)
-page.mouse.click(891, 508)
-wait_timeout(page, 0.3)
-browser.screenshot(page, 'latest_screenshot.png', full_page=False)
-with open('done_1778691983_8094.txt','w') as f: f.write('ok')
