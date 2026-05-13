@@ -1,0 +1,7 @@
+log('Executing recorded actions')
+log('Click at (1082,160)')
+move_mouse(1082, 160)
+page.mouse.click(1082, 160)
+wait_timeout(page, 0.3)
+browser.screenshot(page, 'latest_screenshot.png', full_page=False)
+with open('done_1778692198_653c.txt','w') as f: f.write('ok')
