@@ -1,0 +1,6 @@
+log('Executing recorded actions')
+log('Scroll down 102px')
+browser.scroll(page, 'down', 102)
+wait_timeout(page, 0.2)
+browser.screenshot(page, 'latest_screenshot.png', full_page=False)
+with open('done_1778692184_bdeb.txt','w') as f: f.write('ok')
