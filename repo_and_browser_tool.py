@@ -2,11 +2,11 @@
 """
 Remote‑driven automation orchestrator with WARP proxy, session persistence,
 advanced stealth, shutdown helper, cursor helpers, download capture, and automatic commit.
-Browser profile is kept outside the repo.
 All Git network operations have a 30‑second timeout to prevent hangs.
+Ctrl+C shuts down the loop immediately.
 """
 
-import os, sys, time, traceback, threading, argparse, shutil, re, random, json, subprocess
+import os, sys, time, traceback, threading, argparse, shutil, re, random, json, subprocess, signal
 from git import Repo, GitCommandError
 
 # ---------- Playwright import ----------
@@ -35,6 +35,17 @@ sys.excepthook = global_exception_handler
 
 class ShutdownException(Exception):
     pass
+
+# ---------- Graceful shutdown flag ----------
+shutdown_requested = False
+
+def handle_signal(signum, frame):
+    global shutdown_requested
+    shutdown_requested = True
+    log("Shutdown signal received.")
+
+signal.signal(signal.SIGINT, handle_signal)
+signal.signal(signal.SIGTERM, handle_signal)
 
 # ==================== TASK SCHEDULER ====================
 class TaskScheduler:
@@ -225,7 +236,6 @@ class GitRepo:
         log("[Git] Pulling...")
         try:
             before = self.repo.head.commit.hexsha
-            # Use subprocess git pull with timeout
             args = ['pull', '--depth', '1']
             if rebase:
                 args.append('--rebase')
@@ -329,7 +339,7 @@ class GitRepo:
         self.repo.git.push('origin', branch_name)
         log(f"[Git] Pushed cleared branch '{branch_name}'.")
 
-    # ---------- Session persistence (unchanged, they already use gitpython, but we'll keep them as they are) ----------
+    # ---------- Session persistence ----------
     def push_session_files(self, session_dir, branch="Seasion"):
         log(f"[Git] Pushing session files to '{branch}'...")
         original_branch = self.repo.active_branch.name
@@ -577,7 +587,7 @@ def orchestrate_loop(git_repo, browser, page, scheduler):
         }
 
     # ---------- Main loop ----------
-    while True:
+    while not shutdown_requested:
         try:
             # Force clean working tree to avoid "overwritten by checkout" errors
             try:
